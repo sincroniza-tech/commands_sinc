@@ -3,23 +3,68 @@
 require_relative "commands_sinc/version"
 
 module CommandsSinc
+  BASE_URL = 'https://gateway.sinc.digital/api/v1'.freeze
+
   class Error < StandardError; end
-  class ExcelImporter
+  class ExcelImporterService
+    def self.call(*args)
+      new(*args).call
+    end
+
     def initialize(file_path)
+      @file_path = file_path
+    end
+
+    def call
       read_excel_file(file_path)
+
+    end
+    private
+
+    def update_excel_file(data)
+      excel_file_path = "#{data}"
+      workbook = WriteXLSX.new(excel_file_path)
+
+      worksheet = workbook.add_worksheet('Contacts')
+
+      worksheet.write(0, 0, 'Contact')
+      worksheet.write(0, 1, 'Name')
+
+      row = 1
+      data.each do |contact|
+        worksheet.write(row, 0, contact[:number])
+        worksheet.write(row, 1, contact[:name])
+        row += 1
+      end
+
+      workbook.close
     end
   end
 
-  class ContactsConfirmation
+  class ContactsConfirmationService
+    def self.call(*args)
+      new(*args).call
+    end
+
     def initialize
+      setup_database_connection
+      @token = generate_token
+      @channel_id = choose_channel
+      @contacts = get_contacts
+      @success_counter = Concurrent::AtomicFixnum.new(0)
+      @error_counter = Concurrent::AtomicFixnum.new(0)
+      @imported_contacts = [] # Array para guardar os contatos importados
+    end
+
+    def call
 
     end
   end
 
   private
 
-  def make_http_request(url, data, success_counter, error_counter, invalid_contacts, token)
-    response = HTTParty.post(url, body: data.to_json, headers: { 'Content-Type' => 'application/json', 'Authorization' => token })
+  def make_http_request(url, method, data, success_counter, error_counter, invalid_contacts, token)
+    response = HTTParty.send(method, url, body: data.to_json, headers: { 'Content-Type' => 'application/json', 'Authorization' => token })
   end
 
   def setup_database_connection
@@ -47,99 +92,47 @@ module CommandsSinc
     response_body = JSON.parse(token_response.body)
     "Bearer #{response_body['token']}"
   end
-  # Your code goes here...
-end
 
+  def choose_channel
+    response = HTTParty.get("#{BASE_URL}/channel/all", headers: { 'Content-Type' => 'application/json', 'Authorization' => @token })
 
-def read_excel_file(file_path)
-  excel = Roo::Spreadsheet.open(file_path)
-  sheet = excel.sheet(0) # assuming the data is on the first sheet
+    if response.success?
+      channels = JSON.parse(response.body)['list']
 
-  data = []
-  sheet.each_row_streaming(pad_cells: true) do |row|
-    name = row[0]&.value
-    ddd = row[1]&.value
-    number = row[2]&.value
+      # Encontra o primeiro canal que não tem a variável waba setada como true
+      channel = channels.find { |channel| channel['waba'] == true && channel['primary'] == true }
 
-    next if name.nil? || ddd.nil? || number.nil? # Skip the row if any of the required fields are missing
-
-    formatted_data = {
-      number: "+55#{ddd}#{number}",
-      name: name,
-      channel: "qQOV"
-    }
-
-    data << formatted_data
-  end
-
-  data
-end
-
-def make_http_request(url, data, success_counter, error_counter, invalid_contacts, token)
-  response = HTTParty.post(url, body: data.to_json, headers: { 'Content-Type' => 'application/json', 'Authorization' => token })
-
-  if response.success?
-    success_counter.increment
-    puts "HTTP request successful!"
-    puts "Response body: #{response.body}"
-    puts "Estamos em #{success_counter.value}"
-  elsif response.code == 500 || response.body.include?('invalid_wpp')
-    error_counter.increment
-    puts "Número de WhatsApp inválido. Atualizando planilha..."
-
-
-    update_excel_file(data)
-    if error_counter.value >= 10 && success_counter.value >= 10
-      error_counter.value = 0 # Reset error counter
-      invalid_contacts << data # Guarda a request com erro 500 na array
-      puts "Erro 500. Guardando request para reenvio posterior."
+      # Retorna o id do canal
+      channel['id']
+    else
+      puts "Erro ao recuperar canais: #{response.body}"
+      nil
     end
-  elsif response.code == 401
-    puts "Unauthorized. Generating new token..."
-    token = generate_token
-    make_http_request(url, data, success_counter, error_counter, invalid_contacts, token)
-  elsif response.body.include?('exist_contact')
-    puts "Contato já existente. Ignorando envio."
-  else
-    puts "HTTP request failed!"
-    puts "Error message: #{response.message}"
-    puts "Cannot retry request. Error: Code => #{response.code} Body => #{response.body}"
-  end
-  binding.pry
-end
-
-def generate_token
-  file = File.read('config.json')
-  config = JSON.parse(file)
-  public_id = config['public_id']
-
-  body = { public_id: public_id }.to_json
-  token_response = HTTParty.post('https://gateway.sinc.digital/api/v1/sessions', body: body, headers: { 'Content-Type' => 'application/json' })
-
-  # Extrair o token da resposta JSON
-  response_body = JSON.parse(token_response.body)
-  token = "Bearer #{response_body['token']}"
-end
-
-def update_excel_file(data)
-  excel_file_path = '/Users/matheus.lopes/Downloads/LISTAGEM JUCERJA_NOVAS_EMPRESAS_9_MIL_CNPJ.xlsx'
-  excel_file_path = '/path/to/your/excel/file.xlsx'
-  workbook = WriteXLSX.new(excel_file_path)
-
-  worksheet = workbook.add_worksheet('Contacts')
-
-  worksheet.write(0, 0, 'Contact')
-  worksheet.write(0, 1, 'Name')
-
-  row = 1
-  data.each do |contact|
-    worksheet.write(row, 0, contact[:number])
-    worksheet.write(row, 1, contact[:name])
-    row += 1
   end
 
-  workbook.close
+  def get_contacts
+    data = []
+    begin
+      Parallel.each(1..50, in_threads: 10) do |page|
+        response = HTTParty.get("#{BASE_URL}/contact/all?p=#{page}", headers: { 'Content-Type' => 'application/json', 'Authorization' => @token })
+        protocols = JSON.parse(response.body)["list"]
+        protocols.each do |protocol|
+          data << { number: protocol["number"], name: protocol["name"] }
+        end
+        data.uniq!
+      end
+    rescue => e
+      puts "Error: #{e.message}"
+    end
+    # data.concat([
+    #   { number: "5521998729009", name: "Matheus Lopes"},
+    #   # { number: "5521991852646", name: "Julia Rocha"},
+    #   # { number: "5521995353198", name: "Luigi"},
+    #   # { number: "5521996504030", name: "Sandro Silva"}
+    # ])
+  end
 end
+
 
 # Specify the file path, URL, and make the function call
 # excel_file_path = '/Users/matheus.lopes/Downloads/LISTAGEM JUCERJA_NOVAS_EMPRESAS_9_MIL_CNPJ.xlsx'
