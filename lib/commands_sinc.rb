@@ -7,6 +7,7 @@ module CommandsSinc
 
   class Error < StandardError; end
   class ExcelImporterService
+    require 'roo'
     def self.call(*args)
       new(*args).call
     end
@@ -16,10 +17,25 @@ module CommandsSinc
     end
 
     def call
-      read_excel_file(file_path)
-
+      data = read_excel_file(file_path)
+      update_excel_file(data)
     end
+
     private
+
+
+    def read_excel_file(file_path)
+      xlsx = Roo::Spreadsheet.open(file_path)
+      sheet = xlsx.sheet(0) # assuming you want the first sheet
+
+      data = []
+      sheet.each_row_streaming(offset: 1) do |row| # offset: 1 if your spreadsheet contains a header
+        # assuming first column contains 'number' and second column contains 'name'
+        data << { number: row[0].value, name: row[1].value }
+      end
+
+      data
+    end
 
     def update_excel_file(data)
       excel_file_path = "#{data}"
